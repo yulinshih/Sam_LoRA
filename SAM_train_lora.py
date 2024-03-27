@@ -28,8 +28,8 @@ TO SETUP:
 2. use point prompt?
 3. if box prompt, amodal or modal box
 4. vit_b or vit_h
-5. dataset name, kins or others
-6. train_val_ratio
+5. dataset name, kins or cocoa
+6. 'GTamodal', 'GTmodal', 'AUGamodal' or others to be on the ckpt name
 7. total training epoch number
 8. learning rate
 9. root for pre-computed img embeddings
@@ -41,27 +41,37 @@ TO SETUP:
 '''
 is_box = True
 is_point = False
+is_IoU = False
 box_type = 'modal'
-vit_type = 'vit_b'
+vit_type = 'vit_h'
 dataset_name = 'kins'
-train_val_ratio = [0.8, 0.2]
+train_type = 'GTamodal'
 EPOCHS = 2000
 lr = 1e-4
-img_root = '/work/u6693411/amodal_dataset/kins/training/training/image_2'
-anno_path = '/work/u6693411/amodal_dataset/kins/KITTI_AMODAL_DATASET/train_dict_anno.json'
+img_root = {
+    'kins':'/work/u6693411/amodal_dataset/kins/training/training/image_2',
+    'cocoa':''
+}
+anno_path = {
+    'kins':'/work/u6693411/amodal_dataset/kins/KITTI_AMODAL_DATASET/train_dict_anno.json',
+    'cocoa':''
+}
 tb_save_path = '/work/u6693411/amodal_dataset/checkpoint/runs/'
 ckpt_save_path = '/work/u6693411/amodal_dataset/checkpoint/'
-box_aug_prob = 0.7
-box_aug_param = ((0.1, 0.4), (0.7, 1.3))
-
+lora_save_path = '/work/u6693411/amodal_dataset/lora_checkpoint/'
+box_aug_prob = 0.6
+box_aug_param = ((0.1, 0.3), (0.8, 1.2))
+save_interval = 10
+img_suffix = '.png'
 
 vit_dict = {'vit_b':"sam_vit_b_01ec64.pth", 'vit_h':"sam_vit_h_4b8939.pth"}
 torch.manual_seed(0)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
-sam = sam_model_registry[vit_type](checkpoint="/home/u6693411/SAM/SAM_ckpt/sam_vit_b_01ec64.pth")
+sam = sam_model_registry[vit_type](checkpoint=f"/home/u6693411/SAM/SAM_ckpt/{vit_dict[vit_type]}")
 sam.to(device)
 lora_sam = LoRA_Sam(sam,r = 4)
 lora_sam.to(device)
+mask_threshold = sam.mask_threshold
 transform = ResizeLongestSide(sam.image_encoder.img_size)
 
 @torch.no_grad()
@@ -119,6 +129,11 @@ def set_image(
 
     return set_torch_image(input_image_torch, image.shape[:2])
 
+# rle to binary mask
+def rle_to_mask(rle):
+    mask = mask_utils.decode(rle)
+    return mask
+
 # polygon to binary mask
 def polys_to_mask(polygons, height, width):
 	rles = mask_utils.frPyObjects(polygons, height, width)
@@ -130,6 +145,8 @@ def box_augment(box, range_TL, range_WH):
     # box with shape (N, 4): [[x y w h]..]
     # range_TL [0.1, 0.4]
     # range_WH [0.7, 1.3]
+    if np.random.random() > box_aug_prob:
+        return box
     N = box.shape[0]
     low, high = range_WH
     sampled_WH = np.random.uniform(low, high, (N, 2))
@@ -193,15 +210,14 @@ class AmodalDataset(Dataset):
     def __init__(self, dataset='kins', box_type='modal'):
         self.dataset = dataset
         self.cur_imgid = None
-        self.cur_imgemb = None
+        #self.cur_imgemb = None
         self.box_type = box_type
-        if dataset == 'kins':
-            self.data_root = img_root
-            self.anno_path = anno_path
-            with open(self.anno_path) as f:
-                anns = json.load(f)
-                self.imgs_info = anns['images']
-                self.anns_info = anns["annotations"]
+        self.data_root = img_root[dataset_name]
+        self.anno_path = anno_path[dataset_name]
+        with open(self.anno_path) as f:
+            anns = json.load(f)
+            self.imgs_info = anns['images']
+            self.anns_info = anns["annotations"]
     def __getitem__(self, index):
         img_id = self.imgs_info[index]["id"]
         img_name = self.imgs_info[index]["file_name"]
@@ -215,17 +231,25 @@ class AmodalDataset(Dataset):
 
         # amodal mask GT
         asegm = [anno["a_segm"] for anno in self.anns_info[str(img_id)]]
-        asegm = np.stack([polys_to_mask(mask, h, w) for mask in asegm])
+        #asegm = [anno["segmentation"] for anno in self.anns_info[str(img_id)]]
+        if dataset_name == 'kins':
+            asegm = np.stack([polys_to_mask(mask, h, w) for mask in asegm])
+        if dataset_name == 'cocoa':
+            asegm = np.stack([rle_to_mask(mask, h, w) for mask in asegm])
         asegm = torch.as_tensor(asegm, dtype=torch.float, device=device).unsqueeze(1)  
 
         # amodal bbox GT
         abbox = [anno["a_bbox"] for anno in self.anns_info[str(img_id)]]
+        #abbox = [anno["bbox"] for anno in self.anns_info[str(img_id)]]
 
         point_torch = []
         if is_point:
             # inmodal mask GT
             isegm = [anno["i_segm"] for anno in self.anns_info[str(img_id)]]
             isegm = np.stack([polys_to_mask(mask, h, w) for mask in isegm])
+            # TODO old anno inmodal_seg is rle format
+            #isegm = [anno["inmodal_seg"] for anno in self.anns_info[str(img_id)]]
+            #isegm = np.stack([rle_to_mask(mask) for mask in isegm])
             isegm = torch.as_tensor(isegm, dtype=torch.float, device=device).unsqueeze(1)
             cor_tensor, lab_tensor = pick_rand_point(isegm, asegm, np.array(abbox))
             cor_tensor = transform.apply_coords_torch(cor_tensor, original_size)
@@ -235,14 +259,12 @@ class AmodalDataset(Dataset):
         if is_box:
             # inmodal / amodal bounding box GT for prompt
             bbox = abbox
-            if self.box_type != 'amodal':
+            if self.box_type != 'amodal' and dataset_name == 'kins':
                 bbox = [anno["i_bbox"] for anno in self.anns_info[str(img_id)]]
+                #bbox = [anno["inmodal_bbox"] for anno in self.anns_info[str(img_id)]]
             
             # perform bbox augmentation with set probability 'box_aug_prob'
-            if np.random.random() <= box_aug_prob:
-                bbox_aug = box_augment(np.array(bbox), box_aug_param[0], box_aug_param[1])
-            else:
-                bbox_aug = np.array(bbox)
+            bbox_aug = box_augment(np.array(bbox), box_aug_param[0], box_aug_param[1])
             box_torch = np.hstack((bbox_aug[:, :2], bbox_aug[:, :2] + bbox_aug[:, 2:]))
             box_torch = transform.apply_boxes(box_torch, original_size)
             box_torch = torch.as_tensor(box_torch, dtype=torch.float, device=device)
@@ -257,13 +279,18 @@ loss_fn = torch.nn.BCEWithLogitsLoss()
 
 # Create datasets for training & validation
 dataset = AmodalDataset(dataset_name, box_type)
-training_set, validation_set = random_split(dataset, train_val_ratio)
 
 # shuffle for training, not for validation
-training_loader = torch.utils.data.DataLoader(training_set, batch_size=1, shuffle=True)
-validation_loader = torch.utils.data.DataLoader(validation_set, batch_size=1, shuffle=False)
+training_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
 
-
+def cal_IoU(pred_mask, gt_mask):
+    # mask shape = (N, 1, H, W)
+    pred_area = pred_mask.sum(dim=(1, 2, 3))
+    gt_area = gt_mask.sum(dim=(1, 2, 3))
+    inter = ((pred_mask + gt_mask)==2).sum(dim=(1, 2, 3))
+    mask_iou = inter / (pred_area+gt_area-inter)
+    return mask_iou
+    
 def train_one_epoch(epoch_index, tb_writer):
     running_loss = 0.
     last_loss = 0.
@@ -273,12 +300,12 @@ def train_one_epoch(epoch_index, tb_writer):
         input_image, asegm, bbox, point, original_size, input_size = data
         input_image = torch.squeeze(input_image, 0)
         image_embedding = lora_sam.sam.image_encoder(input_image)
-        asegm = torch.squeeze(asegm, 0)
-        if is_box:
-            bbox = torch.squeeze(bbox, 0)
-        if is_point:
-            point = (point[0].squeeze(0), point[1].squeeze(0))
         with torch.no_grad():
+            asegm = torch.squeeze(asegm, 0)
+            if is_box:
+                bbox = torch.squeeze(bbox, 0)
+            if is_point:
+                point = (point[0].squeeze(0), point[1].squeeze(0))
             sparse_embeddings, dense_embeddings = sam.prompt_encoder(
                 points=point,
                 boxes=bbox,
@@ -294,8 +321,15 @@ def train_one_epoch(epoch_index, tb_writer):
         )
         upscaled_masks = sam.postprocess_masks(low_res_masks, input_size, original_size).to(device)
         
-        # Compute the loss and its gradients
+        # calculate loss for predicted mask & IoU
         loss = loss_fn(upscaled_masks, asegm)
+        if is_IoU:
+            # compute ground truth IoU score
+            pred_masks = upscaled_masks > mask_threshold
+            gt_IoU = cal_IoU(pred_masks, asegm).unsqueeze(1)
+            loss_IoU = loss_fn(iou_predictions, gt_IoU)
+            loss += loss_IoU
+        # Compute gradient
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -312,10 +346,8 @@ def train_one_epoch(epoch_index, tb_writer):
     return last_loss
 
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-writer = SummaryWriter(os.path.join(tb_save_path, 'fashion_trainer_{}'.format(timestamp)))
+writer = SummaryWriter(os.path.join(tb_save_path, 'fashion_trainer_{}_{}'.format(timestamp, train_type)))
 epoch_number = 0
-
-best_vloss = 1_000_000.
 
 for epoch in range(EPOCHS):
     print('EPOCH {}:'.format(epoch_number + 1))
@@ -324,55 +356,19 @@ for epoch in range(EPOCHS):
     sam.mask_decoder.train(True)
     avg_loss = train_one_epoch(epoch_number, writer)
 
-
-    running_vloss = 0.0
-    # Set the model to evaluation mode, disabling dropout and using population
-    # statistics for batch normalization.
-    sam.mask_decoder.eval()
-
-    # reduce memory consumption.
-    with torch.no_grad():
-        for i, vdata in enumerate(validation_loader):
-            vdata = [None if x == [] else x for x in vdata]
-            vinput_image, vasegm, vbbox, vpoint, voriginal_size, vinput_size = vdata
-            vinput_image = torch.squeeze(vinput_image, 0)
-            vimage_embedding = lora_sam.sam.image_encoder(vinput_image)
-            vasegm = torch.squeeze(vasegm, 0)
-            if is_box:
-                vbbox = torch.squeeze(vbbox, 0)
-            if is_point:
-                vpoint = (vpoint[0].squeeze(0), vpoint[1].squeeze(0))
-            vsparse_embeddings, vdense_embeddings = sam.prompt_encoder(
-                points=vpoint,
-                boxes=vbbox,
-                masks=None,
-            )
-            
-            vlow_res_masks, viou_predictions = sam.mask_decoder(
-                image_embeddings=vimage_embedding,
-                image_pe=sam.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=vsparse_embeddings,
-                dense_prompt_embeddings=vdense_embeddings,
-                multimask_output=False,
-            )
-
-            vupscaled_masks = sam.postprocess_masks(vlow_res_masks, vinput_size, voriginal_size).to(device)
-            vloss = loss_fn(vupscaled_masks, vasegm)
-            running_vloss += vloss
-
-    avg_vloss = running_vloss / (i + 1)
-    print('LOSS train {} valid {}'.format(avg_loss, avg_vloss))
+    print('LOSS train {}'.format(avg_loss))
 
     # Log the running loss averaged per batch for both training and validation
-    writer.add_scalars('Training vs. Validation Loss',
-                    { 'Training' : avg_loss, 'Validation' : avg_vloss },
+    writer.add_scalars('Training  Loss',
+                    { 'Training' : avg_loss},
                     epoch_number + 1)
     writer.flush()
 
     # Track best performance, and save the model's state
-    if avg_vloss < best_vloss:
-        best_vloss = avg_vloss
+    if epoch % save_interval == save_interval - 1:
         model_path = os.path.join(ckpt_save_path, 'model_{}_{}'.format(timestamp, epoch_number))
         torch.save(sam.mask_decoder.state_dict(), model_path)
+        lora_path = os.path.join(lora_save_path, 'model_{}_{}'.format(timestamp, epoch_number))
+        sam_lora.save_lora_parameters(lora_path+'.safetensors')
 
     epoch_number += 1
